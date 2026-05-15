@@ -1,0 +1,28 @@
+# Image build definition for KT GiGA WiFi home ax (Mercury KM12-007H)
+#
+# Add this snippet to: target/linux/ramips/image/mt7621.mk
+# 
+# Important notes:
+# - Device uses NAND flash (mt7621-nand layout)
+# - Kernel size: 4MB (matches partition@140000 in DTS)
+# - UBI partition: 122MB (matches partition@540000 in DTS)
+# - Block size for NAND: typically 128KB (PAGESIZE=2048, SUBPAGESIZE=2048, BLOCKSIZE=128k)
+# - Device will be installed via Breed Web Recovery -- not sysupgrade-able from stock
+
+define Device/mercury_km12-007h
+  $(Device/nand)
+  IMAGE_SIZE := 122880k
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  KERNEL_SIZE := 4096k
+  UBINIZE_OPTS := -E 5
+  DEVICE_VENDOR := KT / Mercury
+  DEVICE_MODEL := GiGA WiFi home ax (KM12-007H)
+  DEVICE_PACKAGES := kmod-mt7615e kmod-mt7615-firmware wpad-openssl uboot-envtools
+  KERNEL := $$(KERNEL/default) | uImage lzma
+  KERNEL_INITRAMFS := $$(KERNEL/default) | uImage lzma
+  IMAGES += factory.bin
+  IMAGE/factory.bin := append-kernel | pad-to $$(KERNEL_SIZE) | append-ubi | check-size
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+endef
+TARGET_DEVICES += mercury_km12-007h
