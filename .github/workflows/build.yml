@@ -1,0 +1,189 @@
+name: Build OpenWrt for KM12-007H
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_branch:
+        description: 'OpenWrt branch to build'
+        required: true
+        default: 'openwrt-24.10'
+        type: choice
+        options:
+          - openwrt-24.10
+          - openwrt-23.05
+          - main
+      build_initramfs:
+        description: 'Build initramfs image (for first flash via Breed)'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  TZ: Asia/Riyadh
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gettext gcc-multilib \
+            g++-multilib git gnutls-dev gperf haveged help2man intltool libc6-dev-i386 \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
+            libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev libz-dev lrzsz mkisofs msmtp ninja-build p7zip p7zip-full \
+            patch pkgconf python3 python3-pip python3-ply python3-docutils python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+            upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+          sudo timedatectl set-timezone "$TZ" || true
+
+      - name: Clone OpenWrt source
+        run: |
+          BRANCH="${{ github.event.inputs.openwrt_branch }}"
+          git clone --branch "$BRANCH" --depth 1 https://github.com/openwrt/openwrt.git openwrt
+          cd openwrt
+          echo "OpenWrt branch: $BRANCH"
+          echo "OpenWrt commit: $(git rev-parse HEAD)"
+
+      - name: Update feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Apply KM12-007H patches
+        run: |
+          cd openwrt
+          # Copy DTS file
+          cp ../files/target/linux/ramips/dts/mt7621_mercury_km12-007h.dts \
+             target/linux/ramips/dts/
+
+          # Append image definition
+          cat ../files/target/linux/ramips/image/mt7621.mk.snippet \
+              >> target/linux/ramips/image/mt7621.mk
+
+          # Patch board.d network configuration
+          NETBOARD="target/linux/ramips/mt7621/base-files/etc/board.d/02_network"
+          if [ -f "$NETBOARD" ] && ! grep -q "mercury,km12-007h" "$NETBOARD"; then
+            sed -i '/^\t\*)$/i\
+\tmercury,km12-007h)\
+\t\tucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "wan"\
+\t\t;;' "$NETBOARD"
+          fi
+
+          echo "=== DTS file installed ==="
+          ls -la target/linux/ramips/dts/mt7621_mercury_km12-007h.dts
+          echo ""
+          echo "=== Image definition check ==="
+          grep -c "mercury_km12-007h" target/linux/ramips/image/mt7621.mk
+
+      - name: Create .config
+        run: |
+          cd openwrt
+          cat > .config << 'EOF'
+          CONFIG_TARGET_ramips=y
+          CONFIG_TARGET_ramips_mt7621=y
+          CONFIG_TARGET_ramips_mt7621_DEVICE_mercury_km12-007h=y
+
+          # WiFi driver and firmware
+          CONFIG_PACKAGE_kmod-mt7615e=y
+          CONFIG_PACKAGE_kmod-mt7615-firmware=y
+          CONFIG_PACKAGE_wpad-openssl=y
+
+          # LuCI Web Interface
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_PACKAGE_luci-theme-bootstrap=y
+          CONFIG_PACKAGE_luci-app-firewall=y
+          CONFIG_PACKAGE_luci-app-opkg=y
+
+          # Useful tools
+          CONFIG_PACKAGE_nano=y
+          CONFIG_PACKAGE_htop=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_wget-ssl=y
+          CONFIG_PACKAGE_diffutils=y
+          CONFIG_PACKAGE_iperf3=y
+          CONFIG_PACKAGE_uboot-envtools=y
+
+          # IPv6 support  
+          CONFIG_PACKAGE_odhcpd-ipv6only=y
+          CONFIG_PACKAGE_odhcp6c=y
+
+          # USB support
+          CONFIG_PACKAGE_kmod-usb3=y
+          CONFIG_PACKAGE_kmod-usb-storage=y
+          CONFIG_PACKAGE_block-mount=y
+
+          # Filesystems
+          CONFIG_PACKAGE_kmod-fs-ext4=y
+          CONFIG_PACKAGE_kmod-fs-vfat=y
+          CONFIG_PACKAGE_e2fsprogs=y
+          EOF
+
+          make defconfig
+          echo "=== Final device check ==="
+          grep "mercury_km12-007h" .config || (echo "ERROR: Device not in .config!" && exit 1)
+
+      - name: Download sources
+        run: |
+          cd openwrt
+          make download -j$(nproc) || make download -j1 V=s
+
+      - name: Build firmware
+        run: |
+          cd openwrt
+          echo "=== Starting build with $(nproc) jobs ==="
+          make -j$(nproc) || make -j1 V=s 2>&1 | tail -200
+
+      - name: Show build output
+        if: success()
+        run: |
+          cd openwrt
+          echo "=== Output directory ==="
+          ls -la bin/targets/ramips/mt7621/
+          echo ""
+          echo "=== KM12-007H files ==="
+          ls -la bin/targets/ramips/mt7621/*km12-007h* 2>/dev/null || echo "No files found!"
+
+      - name: Calculate checksums
+        if: success()
+        run: |
+          cd openwrt/bin/targets/ramips/mt7621/
+          sha256sum *km12-007h* > sha256sums-km12-007h.txt 2>/dev/null || true
+          cat sha256sums-km12-007h.txt 2>/dev/null || echo "No firmware files to checksum"
+
+      - name: Upload firmware artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-km12-007h-${{ github.event.inputs.openwrt_branch }}-${{ github.run_number }}
+          path: |
+            openwrt/bin/targets/ramips/mt7621/*km12-007h*
+            openwrt/bin/targets/ramips/mt7621/sha256sums*
+          retention-days: 30
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            openwrt/logs/
+            openwrt/.config
+          retention-days: 7
